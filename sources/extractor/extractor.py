@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/media/user/data/study/repos/FirmAE/.venv/bin/python
 
 """
 Module that performs extraction. For usage, refer to documentation for the class

@@ -19,6 +19,10 @@ fi
 set -e
 set -u
 
+# Force binwalk to use a temporary user directory to avoid triggering file manager
+export BINWALK_USER_DIR="/tmp/.binwalk"
+mkdir -p "$BINWALK_USER_DIR"
+
 if [ -e ./firmae.config ]; then
     source ./firmae.config
 elif [ -e ../firmae.config ]; then
