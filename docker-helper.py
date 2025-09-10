@@ -9,17 +9,17 @@ import signal
 import scripts.util as util
 import multiprocessing as mp
 import logging, coloredlogs
+
+# 设置日志
 coloredlogs.install(level=logging.DEBUG)
 coloredlogs.install(level=logging.INFO)
-#rootLogger = logging.getLogger()
-#rootLogger.setLevel(logging.DEBUG)
-
 
 class docker_helper:
-    def __init__(self, firmae_root, remove_image=False):
+    def __init__(self, firmae_root, remove_image=False, docker_image="fcore"):
         self.firmae_root = firmae_root
         self.count = 0
         self.last_core = None
+        self.docker_image = docker_image
         self.__sync_status()
         self.remove_image = remove_image
 
@@ -28,248 +28,423 @@ class docker_helper:
         self.count = len(containers)
         logging.debug("[*] current core : {}".format(self.count))
 
-    def get_container_list(self, with_pause=False):
-        lines = sp.check_output("docker ps", shell=True).decode().split('\n')[1:-1]
+    def get_container_list(self, with_pause=False, all_containers=False):
+        """获取容器列表，all_containers=True时包括停止的容器"""
+        try:
+            cmd = "docker ps -a" if all_containers else "docker ps"
+            result = sp.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode != 0:
+                logging.error("[-] Docker command failed: {}".format(result.stderr))
+                return []
+            lines = result.stdout.split('\n')[1:-1]
+        except Exception as e:
+            logging.error("[-] Error getting container list: {}".format(e))
+            return []
+        
         ret = []
         for line in lines:
             if not with_pause and line.find("Paused") != -1:
                 continue
-            ret.append(line.split(" ")[-1])
+            if line.strip():
+                ret.append(line.split()[-1])
 
         return ret[::-1]
 
+    def check_existing_container(self, firmware):
+        """检查是否已经存在该固件的容器（包括停止的）"""
+        container_pattern = 'docker[0-9]+_{}'.format(firmware.replace('/', '_').replace(' ', '_').replace('.', '_'))
+        
+        # 首先检查运行中的容器
+        containers = self.get_container_list()
+        for container in containers:
+            if container.startswith(container_pattern.split('_')[0]) and firmware.replace('.', '_') in container:
+                logging.info("[+] Found running container: {}".format(container))
+                return container, "running"
+        
+        # 检查所有容器（包括停止的）
+        all_containers = self.get_container_list(all_containers=True)
+        for container in all_containers:
+            if container.startswith(container_pattern.split('_')[0]) and firmware.replace('.', '_') in container:
+                logging.info("[+] Found stopped container: {}".format(container))
+                return container, "stopped"
+        
+        return None, None
+
+    def start_stopped_container(self, container_name):
+        """启动已停止的容器"""
+        try:
+            result = sp.run(["docker", "start", container_name], capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.info("[+] Container {} started successfully".format(container_name))
+                return True
+            else:
+                logging.error("[-] Failed to start container {}: {}".format(container_name, result.stderr))
+                return False
+        except Exception as e:
+            logging.error("[-] Exception starting container {}: {}".format(container_name, e))
+            return False
+
+    def remove_container(self, container_name):
+        """删除容器"""
+        try:
+            result = sp.run(["docker", "rm", "-f", container_name], capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.info("[+] Container {} removed successfully".format(container_name))
+                return True
+            else:
+                logging.error("[-] Failed to remove container {}: {}".format(container_name, result.stderr))
+                return False
+        except Exception as e:
+            logging.error("[-] Exception removing container {}: {}".format(container_name, e))
+            return False
+
+    def get_container_ip(self, container_name):
+        """获取容器的IP地址"""
+        try:
+            cmd = ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", container_name]
+            result = sp.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except Exception as e:
+            logging.error("[-] Failed to get container IP: {}".format(e))
+        return None
+
+    def setup_network_access(self, container_name):
+        """设置网络访问，包括端口转发和路由"""
+        container_ip = self.get_container_ip(container_name)
+        if not container_ip:
+            logging.error("[-] Could not get container IP")
+            return
+        
+        logging.info("[+] Container IP: {}".format(container_ip))
+        
+        # 添加到固件设备的路由（假设固件IP是192.168.0.1）
+        try:
+            # 先删除可能存在的旧路由
+            sp.run(["sudo", "ip", "route", "del", "192.168.0.1/32"], capture_output=True)
+            
+            # 添加新路由
+            result = sp.run(["sudo", "ip", "route", "add", "192.168.0.1/32", "via", container_ip], 
+                          capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.info("[+] Added route to firmware device: 192.168.0.1 via {}".format(container_ip))
+            else:
+                logging.warning("[!] Failed to add route: {}".format(result.stderr))
+        except Exception as e:
+            logging.error("[-] Exception setting up route: {}".format(e))
+        
+        # 设置端口转发
+        self.setup_port_forwarding(container_name, container_ip)
+        
+        # 显示访问信息
+        logging.info("\n" + "="*60)
+        logging.info("[+] Firmware Access Information:")
+        logging.info("="*60)
+        logging.info("    Direct access (if route is working):")
+        logging.info("      - http://192.168.0.1")
+        logging.info("      - telnet 192.168.0.1")
+        logging.info("    ")
+        logging.info("    Via container IP:")
+        logging.info("      - http://{}:8080 (forwarded to 192.168.0.1:80)".format(container_ip))
+        logging.info("      - http://{}:8443 (forwarded to 192.168.0.1:443)".format(container_ip))
+        logging.info("      - telnet {} 2323 (forwarded to 192.168.0.1:23)".format(container_ip))
+        logging.info("    ")
+        logging.info("    Container shell access:")
+        logging.info("      - docker exec -it {} bash".format(container_name))
+        logging.info("="*60 + "\n")
+
+    def setup_port_forwarding(self, container_name, container_ip):
+        """在容器内设置端口转发"""
+        # 首先检查socat是否已安装
+        check_socat = ["docker", "exec", container_name, "which", "socat"]
+        result = sp.run(check_socat, capture_output=True)
+        
+        if result.returncode != 0:
+            logging.info("[*] Installing socat in container...")
+            install_cmd = ["docker", "exec", container_name, "bash", "-c", 
+                          "apt-get update > /dev/null 2>&1 && apt-get install -y socat > /dev/null 2>&1"]
+            sp.run(install_cmd, capture_output=True)
+        
+        # 端口映射配置
+        port_mappings = [
+            (8080, 80, "HTTP"),
+            (8443, 443, "HTTPS"),
+            (2323, 23, "Telnet"),
+            (2222, 22, "SSH"),
+        ]
+        
+        for listen_port, target_port, service in port_mappings:
+            # 先检查端口是否已经在转发
+            check_cmd = ["docker", "exec", container_name, "pgrep", "-f", "socat.*{}".format(listen_port)]
+            if sp.run(check_cmd, capture_output=True).returncode == 0:
+                logging.debug("[*] {} forwarding already running".format(service))
+                continue
+            
+            forward_cmd = [
+                "docker", "exec", "-d", container_name,
+                "socat", 
+                "TCP-LISTEN:{},fork,reuseaddr".format(listen_port),
+                "TCP:192.168.0.1:{}".format(target_port)
+            ]
+            
+            try:
+                result = sp.run(forward_cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    logging.debug("[+] {} forwarding: {}:{} -> 192.168.0.1:{}".format(
+                        service, container_ip, listen_port, target_port))
+                else:
+                    logging.warning("[!] Failed to setup {} forwarding: {}".format(service, result.stderr))
+            except Exception as e:
+                logging.warning("[!] Exception setting up {} forwarding: {}".format(service, e))
+
     def stop_core(self, container_name):
-        return sp.check_output("docker stop {}".format(container_name), shell=True)
+        try:
+            result = sp.run("docker stop {}".format(container_name), shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.info("[+] Container {} stopped successfully".format(container_name))
+                return result.stdout
+            else:
+                logging.error("[-] Failed to stop container {}: {}".format(container_name, result.stderr))
+        except Exception as e:
+            logging.error("[-] Exception stopping container {}: {}".format(container_name, e))
+            return None
 
     def run_core(self, idx, mode, brand, firmware_path):
         firmware_root = os.path.dirname(firmware_path)
         firmware = os.path.basename(firmware_path)
-        docker_name = 'docker{}_{}'.format(idx, firmware)
-        cmd = """docker run -dit --rm \\
-                -v /dev:/dev \\
-                -v {0}:/work/FirmAE \\
-                -v {1}:/work/firmwares \\
-                --privileged=true \\
-                --name {2} \\
-                fcore""".format(self.firmae_root,
-                                firmware_root,
-                                docker_name)
+        docker_name = 'docker{}_{}'.format(idx, firmware.replace('/', '_').replace(' ', '_').replace('.', '_'))
+        
+        # 首先检查容器是否已经存在（无论运行还是停止）
+        try:
+            # 检查容器是否存在
+            check_cmd = ["docker", "ps", "-a", "--filter", f"name={docker_name}", "--format", "{{.Names}}"]
+            result = sp.run(check_cmd, capture_output=True, text=True)
+            
+            if result.stdout.strip():
+                # 容器存在，检查状态
+                status_cmd = ["docker", "ps", "--filter", f"name={docker_name}", "--format", "{{.Names}}"]
+                status_result = sp.run(status_cmd, capture_output=True, text=True)
+                
+                if status_result.stdout.strip():
+                    # 容器正在运行
+                    logging.info("[+] Container {} is already running".format(docker_name))
+                    self.setup_network_access(docker_name)
+                    
+                    if mode == "-d":
+                        logging.info("[*] Attaching to existing container...")
+                        attach_cmd = ["docker", "exec", "-it", docker_name, "bash"]
+                        try:
+                            sp.run(attach_cmd)
+                        except KeyboardInterrupt:
+                            logging.info("[*] Detached from container")
+                    
+                    return docker_name
+                else:
+                    # 容器已停止
+                    logging.info("[*] Found stopped container: {}".format(docker_name))
+                    response = input("[?] Container exists but is stopped. (s)tart, (r)emove and recreate, or (q)uit? [s]: ").lower() or 's'
+                    
+                    if response == 's':
+                        if self.start_stopped_container(docker_name):
+                            time.sleep(5)
+                            self.setup_network_access(docker_name)
+                            
+                            if mode == "-d":
+                                attach_cmd = ["docker", "exec", "-it", docker_name, "bash"]
+                                try:
+                                    sp.run(attach_cmd)
+                                except KeyboardInterrupt:
+                                    logging.info("[*] Detached from container")
+                            
+                            return docker_name
+                    elif response == 'r':
+                        logging.info("[*] Removing existing container...")
+                        self.remove_container(docker_name)
+                        # 继续创建新容器
+                    else:
+                        logging.info("[*] Exiting...")
+                        return None
+                        
+        except Exception as e:
+            logging.error("[-] Error checking container existence: {}".format(e))
+        # 创建新容器
+        logging.info("[*] Starting new container {} for firmware {}".format(docker_name, firmware))
+        
+        # 检查Docker镜像是否存在
+        try:
+            result = sp.run("docker images -q {}".format(self.docker_image), shell=True, capture_output=True, text=True)
+            if not result.stdout.strip():
+                logging.error("[-] Docker image '{}' not found. Please build the image first.".format(self.docker_image))
+                return docker_name
+        except Exception as e:
+            logging.error("[-] Error checking docker image: {}".format(e))
+            return docker_name
+        
+        # 构建docker run命令
+        cmd = [
+            "docker", "run", "-dit", "--rm",
+            "-v", "/dev:/dev",
+            "-v", "{}:/work/FirmAE".format(self.firmae_root),
+            "-v", "{}:/work/firmwares".format(firmware_root),
+            "--privileged=true",
+            "--name", docker_name,
+            self.docker_image
+        ]
 
-        sp.check_output(cmd, shell=True)
-        logging.info("[*] {} emulation start!".format(docker_name))
+        logging.debug("[*] Docker command: {}".format(' '.join(cmd)))
+
+        try:
+            result = sp.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logging.error("[-] Failed to start container {}: {}".format(docker_name, result.stderr))
+                return docker_name
+            
+            logging.info("[+] Container {} started successfully".format(docker_name))
+            logging.debug("[*] Container ID: {}".format(result.stdout.strip()))
+            
+        except Exception as e:
+            logging.error("[-] Exception starting container {}: {}".format(docker_name, e))
+            return docker_name
+
         time.sleep(5)
 
+        # 检查容器是否真的在运行
+        try:
+            result = sp.run("docker ps --filter name={}".format(docker_name), shell=True, capture_output=True, text=True)
+            if docker_name not in result.stdout:
+                logging.error("[-] Container {} is not running after start".format(docker_name))
+                return docker_name
+        except Exception as e:
+            logging.error("[-] Error checking container status: {}".format(e))
+
+        # 初始化PostgreSQL
+        init_db_cmd = [
+            "docker", "exec", docker_name, "bash", "-c",
+            "service postgresql start && sleep 2 && sudo -u postgres createdb firmware || true && sudo -u postgres psql -d firmware -c \"CREATE EXTENSION IF NOT EXISTS pgcrypto;\" || true"
+        ]
+        
+        try:
+            result = sp.run(init_db_cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                logging.debug("[+] PostgreSQL initialized for {}".format(docker_name))
+            else:
+                logging.warning("[!] PostgreSQL initialization warning for {}: {}".format(docker_name, result.stderr))
+        except Exception as e:
+            logging.warning("[!] PostgreSQL initialization exception for {}: {}".format(docker_name, e))
+
+        # 执行分析命令
         docker_mode = "-it" if mode == "-d" else "-id"
-        cmd = "docker exec {0} \"{1}\" ".format(docker_mode, docker_name)
-        cmd += "bash -c \"cd /work/FirmAE && "
-        cmd += "./run.sh {0} {1} /work/firmwares/{2} ".format(mode,
-                                                              brand,
-                                                              firmware)
+        exec_cmd = [
+            "docker", "exec", docker_mode, docker_name, "bash", "-c",
+            "cd /work/FirmAE && ./run.sh {} {} /work/firmwares/{}".format(mode, brand, firmware)
+        ]
+
         if mode == "-d":
-            cmd += "\""
-        else:
-            cmd += "2>&1 > /work/FirmAE/scratch/{0}.log\" &".format(firmware)
-
-        t0 = time.time()
-        iid = -1
-        if mode == "-d":
-            os.system(cmd)
-        else:
-            sp.check_output(cmd, shell=True)
-        firmware_log = os.path.join(self.firmae_root, "scratch", firmware + ".log")
-
-        if mode == "-r":
-            cmd = "docker exec -it \"{0}\" bash".format(docker_name)
-            os.system(cmd)
-
-        if mode in ["-r", "-d"]:
+            # 交互模式
+            logging.info("[*] Starting interactive mode for {}".format(docker_name))
+            
+            # 设置网络访问（等待一段时间让固件启动）
+            logging.info("[*] Waiting for firmware to start...")
+            time.sleep(10)
+            self.setup_network_access(docker_name)
+            
+            try:
+                sp.run(exec_cmd)
+            except KeyboardInterrupt:
+                logging.info("[*] Interactive mode interrupted")
             return docker_name
-
-        time.sleep(10)
-        while iid == -1:
-            time.sleep(1)
-            iid = util.get_iid(firmware_path, "127.0.0.1")
-            with open(firmware_log) as f:
-                f.readline()
-                last_line = f.readline()
-                if last_line.find("container failed") != -1:
-                    logging.error("[-] %s container failed to connect to the hosts' postgresql".format(docker_name))
-                    return docker_name
-
-        if not iid:
-            logging.error("[-] %s getting iid failed.", docker_name)
-            return docker_name
-
-        # check success of extractor
-        tgz_path = os.path.join(self.firmae_root, "images", str(iid) + ".tar.gz")
-        for i in range(300):
-            time.sleep(1)
-            if os.path.exists(tgz_path):
-                break
         else:
-            logging.error("[-] %s extraction failed.", docker_name)
-            return docker_name
-
-        # check
-        emulation_result = self.check_result(firmware, docker_name, brand, iid, True)
-        time_elapsed = time.time() - t0
-
-        work_dir = os.path.join(self.firmae_root, "scratch", str(iid))
-        if os.path.exists(work_dir):
-            with open(os.path.join(work_dir, 'time_elapsed'), 'w') as f:
-                f.write("%0.4f\n" % (time_elapsed))
-
-            os.rename(os.path.join(self.firmae_root, 'scratch',
-                                   "{0}.log".format(firmware)),
-                      os.path.join(work_dir, "{0}.log".format(firmware)))
-
-            with open(os.path.join(work_dir, 'fullname'), 'w') as f:
-                f.write("%s\n" % (firmware_path))
-
-            if self.remove_image:
-                image_name = os.path.join(work_dir, 'image.raw')
-                if os.path.exists(image_name):
-                    os.remove(image_name)
-
-        if emulation_result:
-            logging.info("[+] %s emulation finished. (%0.4fs)", docker_name, time_elapsed)
-
-            # analyses
-            if mode == "-a":
-                t1 = time.time()
-                analyses_result = self.check_result(firmware, docker_name, brand, iid, False)
-                time_elapsed = time.time() - t1
-
-                if analyses_result:
-                    logging.info("[+] %s analysis finished. (%0.4fs)", docker_name, time_elapsed)
-                else:
-                    logging.error("[-] %s analysis failed. (%0.4fs)", docker_name, time_elapsed)
-
-        else:
-            logging.error("[-] %s emulation failed. (%0.4fs)", docker_name, time_elapsed)
+            # 后台模式
+            log_file = "/work/FirmAE/scratch/{}.log".format(firmware)
+            exec_cmd[-1] += " 2>&1 > {} &".format(log_file)
+            
+            try:
+                result = sp.run(exec_cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logging.error("[-] Failed to execute analysis in {}: {}".format(docker_name, result.stderr))
+                    
+                # 等待固件启动并设置网络
+                logging.info("[*] Waiting for firmware to start...")
+                time.sleep(20)
+                self.setup_network_access(docker_name)
+                
+            except Exception as e:
+                logging.error("[-] Exception executing analysis in {}: {}".format(docker_name, e))
 
         return docker_name
 
     def run_command(self, core, cmd):
         result = '[-] failed'
         try:
-            result = sp.check_output('docker exec -it {} bash -c "{}"'.format(core, cmd), shell=True).decode()
-        except:
-            pass
-
-        return result
-
-    def run_script(self, core, script):
-        result = '[-] failed'
-        try:
-            sp.check_output('docker cp {} {}:/'.format(script, core), shell=True)
-            result = sp.check_output('docker exec -it {} /{}'.format(core, script), shell=True).decode()
-        except:
-            pass
-
-        return result
-
-    def check_result(self, firmware, docker_name, brand, iid, is_emulation=True):
-        time.sleep(10) # wait until re-run
-        if is_emulation:
-            result_path = "{}/scratch/{}/result".format(self.firmae_root, iid)
-            timeout = 2400
-        else:
-            result_path = "{}/analyses/analyses_log/{}/{}/result".format(self.firmae_root, brand, iid)
-            timeout = 3600
-
-        for i in range(timeout):
-            time.sleep(1)
-
-            if not os.path.exists(result_path):
-                continue
-
-            with open(result_path) as f:
-                result = f.read().strip()
-                if result == "true":
-                    return True
-                else:
-                    return False
-
-        return False
-
-    def get_docker_tap_ip(self, docker_name):
-        result = 'None'
-        try:
-            result = sp.check_output('docker exec -it {} bash -c "ip route"'.format(docker_name), shell=True).decode().split(' \r\n')[-2].split(' ')[0]
-        except:
-            pass
-
+            result = sp.run('docker exec -it {} bash -c "{}"'.format(core, cmd), shell=True, capture_output=True, text=True)
+            return result.stdout if result.returncode == 0 else result.stderr
+        except Exception as e:
+            logging.error("[-] Failed to run command in {}: {}".format(core, e))
         return result
 
 def print_usage(argv0):
-    print("[*] Usage")
-    print("sudo %s [-e, -c, -s] [brand] [firmwre_name]" % argv0)
-    return
+    print("[*] Usage:")
+    print("  {} -ec [brand] [firmware_path]    # Extract and emulate".format(argv0))
+    print("  {} -ea [brand] [firmware_path]    # Extract, emulate and analyze".format(argv0))
+    print("  {} -ed [firmware_path]            # Extract and debug".format(argv0))
+    print("  {} -er [firmware_path]            # Extract and run".format(argv0))
+    print("  {} -d [brand] [firmware_path]     # Debug mode (same as -ed)".format(argv0))
+    print("  {} -c [command]                   # Run command in all containers".format(argv0))
+    print("  {} -s [script]                    # Run script in all containers".format(argv0))
 
 def runner(args):
     (idx, dh, mode, brand, firmware) = args
     if os.path.isfile(firmware):
         docker_name = dh.run_core(idx, mode, brand, firmware)
-        dh.stop_core(docker_name)
+        if mode not in ["-d", "-r"]:  # 不在调试/运行模式时才自动停止
+            dh.stop_core(docker_name)
     else:
-        logging.error("[-] Can't find firmware file")
+        logging.error("[-] Can't find firmware file: {}".format(firmware))
 
 def main():
     if len(sys.argv) < 2:
         print_usage(sys.argv[0])
         exit(1)
 
-    firmae_root=os.path.abspath('.')
-    dh = docker_helper(firmae_root, remove_image=False)
+    firmae_root = os.path.abspath('.')
+    docker_image = os.environ.get('FIRMAE_DOCKER_IMAGE', 'fcore')
+    dh = docker_helper(firmae_root, remove_image=False, docker_image=docker_image)
 
-    if sys.argv[1] in ['-ec', '-ea']:
+    # 处理 -d 参数（调试模式）
+    if sys.argv[1] == '-d':
         if len(sys.argv) < 4:
             print_usage(sys.argv[0])
             exit(1)
 
         if not os.path.exists(os.path.join(firmae_root, "scratch")):
-            os.mkdir(os.path.join(firmae_root, "scratch"))
+            os.makedirs(os.path.join(firmae_root, "scratch"), exist_ok=True)
+
+        brand = sys.argv[2]
+        firmware_path = os.path.abspath(sys.argv[3])
+        
+        if os.path.isfile(firmware_path):
+            argv = (0, dh, "-d", brand, firmware_path)
+            runner(argv)
+        else:
+            logging.error("[-] Firmware file not found: {}".format(firmware_path))
+
+    elif sys.argv[1] in ['-ec', '-ea']:
+        if len(sys.argv) < 4:
+            print_usage(sys.argv[0])
+            exit(1)
+
+        if not os.path.exists(os.path.join(firmae_root, "scratch")):
+            os.makedirs(os.path.join(firmae_root, "scratch"), exist_ok=True)
 
         brand = sys.argv[2]
         mode = '-' + sys.argv[1][-1]
         firmware_path = os.path.abspath(sys.argv[3])
+        
         if os.path.isfile(firmware_path) and not firmware_path.endswith('.list'):
             argv = (0, dh, mode, brand, firmware_path)
             runner(argv)
-
-        elif os.path.isfile(firmware_path) and firmware_path.endswith('.list') \
-            or os.path.isdir(firmware_path):
-            # TODO: check number of firmwares
-
-            if os.path.isdir(firmware_path):
-                firmwares = []
-                for directory, sub_directory, filename_list in os.walk(firmware_path):
-                    for filename in filename_list:
-                        firmwares.append(os.path.join(directory, filename))
-
-            else:
-                # this accepts firmware list file
-                with open(firmware_path, 'r') as f:
-                    firmwares = f.read().splitlines()
-
-            num_cores = mp.cpu_count()
-            if len(firmwares) < num_cores:
-                num_cores = len(firmwares)
-
-            logging.info("[*] Using %d cores ..." % (num_cores))
-            t0 = time.time()
-
-            p = mp.Pool(num_cores)
-            for idx, firmware in enumerate(firmwares):
-                arg=(idx, dh, mode, brand, firmware)
-                p.apply_async(runner, args=(arg,))
-                time.sleep(1)
-            p.close()
-            p.join()
-
-            logging.info("[*] Processing %d firmware done. (%0.4fs)",
-                         len(firmwares), time.time() - t0)
+        else:
+            logging.error("[-] Invalid firmware path: {}".format(firmware_path))
 
     elif sys.argv[1] in ['-er', '-ed']:
         if len(sys.argv) < 3:
@@ -281,6 +456,8 @@ def main():
         if os.path.isfile(firmware_path):
             argv = (0, dh, mode, "auto", firmware_path)
             runner(argv)
+        else:
+            logging.error("[-] Firmware file not found: {}".format(firmware_path))
 
     elif sys.argv[1] == '-c':
         if len(sys.argv) != 3:
@@ -288,19 +465,12 @@ def main():
             exit(1)
 
         cmd = sys.argv[2]
-        for core in dh.get_container_list():
+        containers = dh.get_container_list()
+        if not containers:
+            logging.info("[*] No running containers found")
+        for core in containers:
             print(core)
             print(dh.run_command(core, cmd))
-
-    elif sys.argv[1] == '-s':
-        if len(sys.argv) != 3:
-            print_usage(sys.argv[0])
-            exit(1)
-
-        script = sys.argv[2]
-        for core in dh.get_container_list():
-            print(core)
-            print(dh.run_script(core, script))
 
 if __name__ == "__main__":
     main()
